@@ -4,7 +4,7 @@
 
 ### Summary
 
-This is kafk source and file sink example for spark streaming. In this application kafka console producer is used to stream invoice data. Spark applications read from kafka source and apply deserialization and transformation. Finally transformed data written into hdfs.
+This is kafka source cassandra database sink example. In this spark application we are streaming login data of some users. At the same time we are reading historical data from cassandra database and join streaming data with static data to update cassandra table with new records. That way we are keep tracking last login time of each users using spark streaming application.
 
 ### Task List
 
@@ -20,98 +20,116 @@ INSERT INTO users (Login_id, user_name, last_login) VALUES( '100001', 'Enes', '2
 INSERT INTO users (Login_id, user_name, last_login) VALUES( '100009', 'Dilara', '2019-03-07 11:03:00');
 INSERT INTO users (Login_id, user_name, last_login) VALUES( '100087', 'Osman', '2019-06-12 09:43:00');
 ```
-- [x] Create spark session and initialize logger (You can use ".master("local[*])" instead of yarn if you are running Spark on standalone mode")
+
+- [x] Create kafka topic
 ```
-if __name__ == "__main__":
+/home/enes/Software/kafka_2.12-2.7.0/bin/kafka-topics.sh --create --zookeeper localhost:2181 --replication-factor 1 --partitions 1 --topic logins
+```
+- [x] Create spark session and define cassandra configuration (You can use ".master("local[*])" instead of yarn if you are running Spark on standalone mode")
+```
+# Create spark session
     spark = SparkSession \
         .builder \
-        .appName("Kafka stream") \
-        .config("spark.streaming.stop.stopGracefullyOnShutdown", "true") \
+        .appName("Stream Table Join") \
         .master("yarn") \
+        .config("spark.streaming.stopGracefullyOnShutdown", "true") \
+        .config("spark.sql.shuffle.partitions", 2) \
+        .config("spark.cassandra.connection.host", "localhost") \
+        .config("spark.cassandra.connection.port", "9042") \
         .getOrCreate()
-
-    logger = Log4j(spark)
 ```
-- [x] Define schema
+- [x] Define schema for incoming data
 ```
-schema = StructType([
-  StructField("InvoiceNumber", StringType()),
-  StructField("CreatedTime", LongType()),
-  StructField("StoreID", StringType()),
-  StructField("PosID", StringType()),
-  StructField("CashierID", StringType()),
-  StructField("CustomerType", StringType()),
-  StructField("CustomerCardNo", StringType()),
-  StructField("TotalAmount", DoubleType()),
-  StructField("NumberOfItems", IntegerType()),
-  StructField("PaymentMethod", StringType()),
-  StructField("CGST", DoubleType()),
-  StructField("SGST", DoubleType()),
-  StructField("CESS", DoubleType()),
-  StructField("DeliveryType", StringType()),
-  StructField("DeliveryAddress", StructType([
-      StructField("AddressLine", StringType()),
-      StructField("City", StringType()),
-      StructField("State", StringType()),
-      StructField("PinCode", StringType()),
-      StructField("ContactNumber", StringType())
-  ])),
-  StructField("InvoiceLineItems", ArrayType(StructType([
-      StructField("ItemCode", StringType()),
-      StructField("ItemDescription", StringType()),
-      StructField("ItemPrice", DoubleType()),
-      StructField("ItemQty", IntegerType()),
-      StructField("TotalValue", DoubleType())
-  ]))),
-])
+# Define schema for incoming data
+    login_schema = StructType([
+        StructField("created_time", StringType()),
+        StructField("login_id", StringType())
+    ])
 ```
 - [x] Read data from kafka source
 ```
-kafka_df = spark.readStream \
-      .format("kafka") \
-      .option("kafka.bootstrap.servers", "localhost:9092") \
-      .option("subscribe", "invoices") \
-      .option("startingOffsets", "earliest") \
-      .load()
+# Read data from kafka topic
+    kafka_source_df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "localhost:9092") \
+        .option("subscribe", "logins") \
+        .option("startingOffsets", "earliest") \
+        .load()
+```
+- [x] Apply deserialization
+```
+# Deserialization
+    value_df = kafka_source_df.select(from_json(col("value").cast("string"), login_schema).alias("value"))
+```
+- [x] Convert time data to timestamp
+```
+# Convert "created_time" data to timestamp
+    login_df = value_df.select("value.*") \
+        .withColumn("created_time", to_timestamp(col("created_time"), "yyyy-MM-dd HH:mm:ss"))
+```
+
+- [x] Read existing data from cassandra database
+```
+#Read current cassandra table
+
+    user_df = spark.read \
+        .format("org.apache.spark.sql.cassandra") \
+        .option("keyspace", "spark_db") \
+        .option("table", "users") \
+        .load()
+```
+
+- [x] Define join statements
+```
+# Define join statements
+    join_expr = login_df.login_id == user_df.login_id
+    join_type = "inner"
+```
+
+- [x] Join streaming data with static data from cassandra
+```
+# Join new data from kafka (streaming data) with existing data from cassandra (static data)
+    joined_df = login_df.join(user_df, join_expr, join_type) \
+        .drop(login_df.login_id)
+```
+
+- [x] Create output column for updated data
+```
+# Create output column to update last login record in cassandra db
+    output_df = joined_df.select(col("login_id"), col("user_name"),
+                                 col("created_time").alias("last_login"))
+```
+
+- [x] Define foreachBatch function to save updated data to cassandra
+```
+# Define foreachbatch function to save stream data to cassandra table
+def write_to_cassandra(target_df, batch_id):
+    target_df.write \
+        .format("org.apache.spark.sql.cassandra") \
+        .option("keyspace", "spark_db") \
+        .option("table", "users") \
+        .mode("append") \
+        .save()
+    target_df.show()
 
 ```
-- [x] Apply transformations
-```
-value_df = kafka_df.select(from_json(col("value").cast("string"), schema).alias("value"))
-  #value_df.printSchema()
-  explode_df = value_df.selectExpr("value.InvoiceNumber", "value.CreatedTime", "value.StoreID",
-                               "value.PosID", "value.CustomerType", "value.PaymentMethod", "value.DeliveryType",
-                               "value.DeliveryAddress.City",
-                               "value.DeliveryAddress.State", "value.DeliveryAddress.PinCode",
-                               "explode(value.InvoiceLineItems) as LineItem")
 
-  #explode_df.printSchema()
-
-  flattened_df = explode_df \
-  .withColumn("ItemCode", expr("LineItem.ItemCode")) \
-  .withColumn("ItemDescription", expr("LineItem.ItemDescription")) \
-  .withColumn("ItemPrice", expr("LineItem.ItemPrice")) \
-  .withColumn("ItemQty", expr("LineItem.ItemQty")) \
-  .withColumn("TotalValue", expr("LineItem.TotalValue")) \
-  .drop("LineItem")
+- [x] Finally write data into cassandra db
 ```
-- [x] Write data into hdfs location
-```
-invoice_writer_query = flattened_df.writeStream \
-    .format("json") \
-    .queryName("Flattened Invoice Writer") \
-    .outputMode("append") \
-    .option("path", "/home/enes/Applications/output2") \
-    .option("checkpointLocation", "Kafkastream/chk-point-dir") \
-    .trigger(processingTime="1 minute") \
-    .start()
+# Write joined data into cassandra table
+    output_query = output_df.writeStream \
+        .foreachBatch(write_to_cassandra) \
+        .outputMode("update") \
+        .option("checkpointLocation", "Cassandra/chk-point-dir") \
+        .trigger(processingTime="1 minute") \
+        .start()
 
-invoice_writer_query.awaitTermination()
+    output_query.awaitTermination()
 ```
 
 ### Code Description
 
-kafkastream.py is spark script to read data from kafka source and make desired transformations as well as writing data into hdfs location.
+spark_kafka_cassandra_join.py file is spark application to read data from both kafka source and cassandra database, kafka data will be deserialized and joined with existing data and updated login information inserted into cassandra database. It is good example when you required to update or map some external informations without allocating memory to much. You can always use external database to store metadata.
 
 ### Running
 
@@ -119,56 +137,22 @@ kafkastream.py is spark script to read data from kafka source and make desired t
 
 2. Run kafka-console producer
 ```
-/home/enes/Software/kafka_2.12-2.7.0/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic invoices
+/home/enes/Software/kafka_2.12-2.7.0/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic logins
 ```
-3. Enter sample data
+
+3. Create cassandra db and insert values
+
+4. Check values from cassandra db
+
+![](cassandra_data.JPG)
+
+5. Enter sample data to kafka console producer
 ```json
 {
-  "InvoiceNumber": "51402977",
-  "CreatedTime": 1595688900348,
-  "StoreID": "STR7188",
-  "PosID": "POS956",
-  "CashierID": "OAS134",
-  "CustomerType": "PRIME",
-  "CustomerCardNo": "4629185211",
-  "TotalAmount": 11114,
-  "NumberOfItems": 4,
-  "PaymentMethod": "CARD",
-  "TaxableAmount": 11114,
-  "CGST": 277.85,
-  "SGST": 277.85,
-  "CESS": 13.8925,
-  "DeliveryType": "TAKEAWAY",
-  "InvoiceLineItems": [
-    {
-      "ItemCode": "458",
-      "ItemDescription": "Wine glass",
-      "ItemPrice": 1644,
-      "ItemQty": 2,
-      "TotalValue": 3288
-    },
-    {
-      "ItemCode": "283",
-      "ItemDescription": "Portable Lamps",
-      "ItemPrice": 2236,
-      "ItemQty": 1,
-      "TotalValue": 2236
-    },
-    {
-      "ItemCode": "498",
-      "ItemDescription": "Carving knifes",
-      "ItemPrice": 1424,
-      "ItemQty": 2,
-      "TotalValue": 2848
-    },
-    {
-      "ItemCode": "523",
-      "ItemDescription": "Oil-lamp clock",
-      "ItemPrice": 1371,
-      "ItemQty": 2,
-      "TotalValue": 2742
-    }
-  ]
+  "login_id": "100001",
+  "created_time": "2020-09-09 10:18:00"
 }
 ```
-4. Check hdfs location for output
+6. Check cassandra table for result
+
+![](cassandra_data_after_spark.JPG)
